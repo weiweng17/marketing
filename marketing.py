@@ -590,34 +590,66 @@ def main():
                     else:
                         st.info("数据维度不足或数值单一，无法计算相关性。")
 
-                with h2:
+               with h2:
                     st.markdown("#### ⚖️ 帕累托分析")
+                    # 1. 数据准备
                     p_df = df.sort_values('月销售额($)', ascending=False).reset_index(drop=True)
-                    p_df['累计占比'] = p_df['月销售额($)'].cumsum() / p_df['月销售额($)'].sum() * 100
-                    p_df['产品占比'] = (p_df.index + 1) / len(p_df) * 100
-
-                    st.caption("💡 结论: 头部产品贡献了绝大部分销售额")
-
-                    # 1. 确保数据非空
+                    
                     if not p_df.empty:
-                        # 2. 添加起始点 (0,0)，确保线条从原点出发（优化视觉）
+                        # 计算累计占比
+                        total_revenue = df['月销售额($)'].sum()
+                        # 防止总销售额为0导致除以0错误
+                        if total_revenue > 0:
+                            p_df['累计占比'] = p_df['月销售额($)'].cumsum() / total_revenue * 100
+                        else:
+                            p_df['累计占比'] = 0
+                            
+                        p_df['产品占比'] = (p_df.index + 1) / len(p_df) * 100
+                        
+                        # --- 关键计算：生成你要求的两个结论 ---
+                        # 1. 计算头部 20% 产品贡献的销售额占比
+                        idx_20_pct = int(len(p_df) * 0.2)
+                        # 边界处理：如果产品少于5个，20%可能索引为0，取第一条数据
+                        idx_20_pct = max(0, min(idx_20_pct, len(p_df) - 1))
+                        val_20_pct_contribution = p_df.iloc[idx_20_pct]['累计占比']
+                        
+                        # 2. 计算多少产品占据了 80% 的销售额
+                        # 找到第一个累计占比 >= 80 的行
+                        target_row = p_df[p_df['累计占比'] >= 80]
+                        if not target_row.empty:
+                            val_80_pct_products = target_row.iloc[0]['产品占比']
+                        else:
+                            val_80_pct_products = 100 # 如果没达到80%，则为100%
+
+                        # --- 显示结论文字 ---
+                        st.info(f"""
+                        **💡 帕累托法则 (80/20) 验证结论:**
+                        1. 头部 **20%** 的产品贡献了市场 **{val_20_pct_contribution:.1f}%** 的销售额。
+                        2. 仅需前 **{val_80_pct_products:.1f}%** 的产品即可覆盖市场 **80%** 的营收。
+                        """)
+
+                        # --- 绘图逻辑 (包含V10.0的高度/坐标轴修复) ---
+                        # 添加原点 (0,0) 让曲线更美观
                         start_row = pd.DataFrame({'产品占比': [0], '累计占比': [0]})
-                        p_df = pd.concat([start_row, p_df], ignore_index=True)
+                        p_df_plot = pd.concat([start_row, p_df], ignore_index=True)
 
-                        fig_pareto = px.line(p_df, x='产品占比', y='累计占比', title="80/20法则分析",
-                                             template=TEMPLATE_THEME,
-                                             render_mode='svg')  # <--- 必须加这句！强制用 SVG 画线
-
-                        # 强制加粗线条，设置显眼的颜色
-                        fig_pareto.update_traces(line=dict(color='#E74C3C', width=4))
-
-                        # 设置坐标轴范围，稍微留点空隙
-                        fig_pareto.update_xaxes(title="产品数量占比 (%)", range=[-1, 101])
-                        fig_pareto.update_yaxes(title="累计销售额占比 (%)", range=[-1, 105])
-
+                        fig_pareto = px.line(
+                            p_df_plot, 
+                            x='产品占比', 
+                            y='累计占比', 
+                            title="累计销售额占比曲线", 
+                            template=TEMPLATE_THEME
+                        )
+                        
+                        # 关键修复：强制固定坐标轴范围和高度，防止导出时线条消失
+                        fig_pareto.update_xaxes(range=[0, 105], title="产品数量占比 (%)")
+                        fig_pareto.update_yaxes(range=[0, 105], title="累计销售额占比 (%)")
+                        fig_pareto.update_layout(height=500, autosize=False) 
+                        
+                        # 添加辅助线
                         fig_pareto.add_hline(y=80, line_dash="dash", line_color="green", annotation_text="80% 营收")
                         fig_pareto.add_vline(x=20, line_dash="dash", line_color="orange", annotation_text="20% 产品")
-
+                        
                         st.plotly_chart(fig_pareto, use_container_width=True, config=DOWNLOAD_CONFIG)
                         export_charts["⚖️ 帕累托分析"] = fig_pareto
                     else:
