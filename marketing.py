@@ -8,6 +8,7 @@ from datetime import datetime
 import io
 from collections import Counter
 import re
+import ai_analysis
 import numpy as np
 
 # --- 页面基础设置 ---
@@ -52,6 +53,7 @@ st.markdown("""
 # 1. 数据清洗函数 (逻辑严格还原 V3.4)
 # ==========================================
 @st.cache_data
+@st.cache_data
 def load_data(file):
     try:
         # 1. 读取文件
@@ -66,24 +68,22 @@ def load_data(file):
         else:
             df = pd.read_excel(file)
 
-        # 2. 表头清洗
+        # 2. 表头清洗 (去除前后空格)
         df.columns = df.columns.str.strip()
 
         # 3. 货币与数字清洗
         cols_to_clean = ['月销售额($)', '价格($)', 'FBA($)', '子体销售额($)', '买家运费($)']
         for col in cols_to_clean:
             if col in df.columns:
-                # 增加处理 'Free' 或 '-' 等非数字字符
                 df[col] = df[col].astype(str).apply(lambda x: re.sub(r'[^\d.-]', '', x))
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
 
-        # 4. 百分比清洗 (还原：不做除法，保留原值)
+        # 4. 百分比清洗
         percent_cols = ['毛利率', '留评率', '月销量增长率']
         for col in percent_cols:
             if col in df.columns:
                 df[col] = df[col].astype(str).str.replace('%', '', regex=False).str.replace(',', '', regex=False)
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                # 严格遵守原版逻辑：不自动除以100
 
         # 5. 整数清洗
         int_cols = ['月销量', '评分数', '上架天数', '变体数']
@@ -101,17 +101,45 @@ def load_data(file):
             if '上架天数' not in df.columns or df['上架天数'].sum() == 0:
                 df['上架天数'] = df['计算上架天数'].fillna(0).astype(int)
             df['上架月份'] = df['上架时间'].dt.month_name()
-
-            # 新品逻辑
             df['是否新品'] = df['上架天数'].apply(lambda x: '新品 (<90天)' if x <= 90 else '老品')
 
-        # 7. 属性列标准化
-        attr_cols = ['品牌', '大类目', '配送方式', 'BuyBox类型', '商品标题']
-        for col in attr_cols:
+        # 7. 文本填充
+        text_cols = ['品牌', '大类目', '配送方式', 'BuyBox类型', '商品标题']
+        for col in text_cols:
             if col in df.columns:
-                df[col] = df[col].astype(str).replace('nan', 'Unknown').replace('', 'Unknown')
+                df[col] = df[col].fillna('Unknown').astype(str)
             elif col in ['品牌', '大类目']:
                 df[col] = 'Unknown'
+
+        # ==========================================
+        # 🖼️ 智能图片列识别 (V12.0 增强版)
+        # ==========================================
+        found_img_col = None
+
+        # 策略A: 模糊匹配列名 (忽略大小写)
+        potential_cols = [c for c in df.columns if
+                          any(k in c.lower() for k in ['image', 'img', 'photo', '主图', '图片'])]
+
+        # 策略B: 内容检测 (如果列名匹配到了，检查内容是否像URL)
+        for col in potential_cols:
+            # 取第一条非空数据检查
+            sample = df[col].dropna().astype(str).iloc[0] if not df[col].dropna().empty else ""
+            if sample.startswith('http'):
+                found_img_col = col
+                break
+
+        # 赋值逻辑：先存为原始列名，后续在 main 函数中处理
+        if found_img_col:
+            df['__Auto_Detected_Image_Col__'] = df[found_img_col]
+        else:
+            # 如果没找到，尝试用 ASIN 构造
+            if 'ASIN' in df.columns:
+                df['__Auto_Detected_Image_Col__'] = df['ASIN'].apply(
+                    lambda
+                        asin: f"https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&Format=_SL250_&ASIN={str(asin).strip()}&MarketPlace=US&ID=AsinImage&WS=1&ServiceVersion=20070822"
+                )
+            else:
+                df['__Auto_Detected_Image_Col__'] = None
 
         return df
 
@@ -293,6 +321,27 @@ def main():
         if df_raw is not None:
             df = df_raw.copy()
 
+            with st.sidebar.expander("🖼️ 图片显示设置", expanded=True):
+                # 获取所有列名
+                all_cols = df.columns.tolist()
+                # 排除掉我们内部生成的列
+                clean_cols = [c for c in all_cols if c != '__Auto_Detected_Image_Col__']
+
+                # 下拉框：默认选择 "自动检测"
+                img_option = st.selectbox(
+                    "选择包含图片的列:",
+                    options=["⚡ 自动检测 / ASIN构造"] + clean_cols,
+                    help="如果图片显示失败，请在此处手动选择你的表格中包含图片链接的那一列"
+                )
+
+                # 逻辑判断
+                if img_option == "⚡ 自动检测 / ASIN构造":
+                    # 使用 load_data 中自动生成的列
+                    df['Product_Img'] = df.get('__Auto_Detected_Image_Col__')
+                else:
+                    # 使用用户手动指定的列
+                    st.success(f"已指定: {img_option}")
+                    df['Product_Img'] = df[img_option]
             # 还原：详细参数解析开关
             with st.sidebar.expander("🔧 参数解析设置", expanded=False):
                 df = parse_detailed_params(df)
@@ -346,6 +395,48 @@ def main():
 
             # 模块 1: 机会矩阵 + 排行榜
             st.header("1. 市场机会扫描 (Market Opportunity)")
+            # === ✨ 新增：Top 3 冠军画廊 ===
+            if '月销售额($)' in df.columns and 'Product_Img' in df.columns:
+                # 🔽 修改点：按 '月销售额($)' 降序排列，取前3
+                top3 = df.sort_values('月销售额($)', ascending=False).head(3).reset_index()
+
+                with st.expander(f"🏆 点击展开：市场销售额(GMV) Top 3 冠军产品画廊", expanded=False):
+                    g1, g2, g3 = st.columns(3)
+
+                    # 辅助函数：渲染卡片 (保留之前的防报错逻辑)
+                    def render_card(col, row, rank):
+                        with col:
+                            # 增加皇冠图标区分名次
+                            crowns = {1: "🥇", 2: "🥈", 3: "🥉"}
+                            st.markdown(f"#### {crowns.get(rank, '')} No.{rank}")
+
+                            # 图片渲染 (带类型检查)
+                            img_url = row.get('Product_Img')
+                            if isinstance(img_url, str) and len(img_url) > 5:
+                                try:
+                                    st.image(img_url, width=150)
+                                except:
+                                    st.warning("图片加载失败")
+                            else:
+                                st.info("🖼️ 暂无图片")
+
+                            # 显示核心数据 (销售额加粗显示)
+                            st.markdown(f"""
+                                      - **ASIN**: `{row['ASIN']}`
+                                      - **月收**: **${row['月销售额($)']:,.0f}**
+                                      - **销量**: {row['月销量']} 件
+                                      - **价格**: ${row['价格($)']:.2f}
+                                      """)
+
+                            if '商品标题' in row:
+                                short_title = str(row['商品标题'])[:50] + "..."
+                                st.caption(short_title)
+
+                    # 依次渲染
+                    if len(top3) >= 1: render_card(g1, top3.iloc[0], 1)
+                    if len(top3) >= 2: render_card(g2, top3.iloc[1], 2)
+                    if len(top3) >= 3: render_card(g3, top3.iloc[2], 3)
+            # ==================================
             c1, c2 = st.columns([2, 1])
 
             with c1:
@@ -399,24 +490,44 @@ def main():
                     export_charts["📈 产品潜力四象限分析"] = fig_matrix
 
             with c2:
-                # 还原：增长率排行榜 DataFrame
-                st.markdown("#### 📈 所有ASIN增长率排行榜")
+                st.markdown("#### 📸 视觉化飙升榜 (Top 20)")
                 if '月销量增长率' in df.columns:
-                    growth_ranking = df[['ASIN', '月销量', '月销量增长率', '价格($)', '品牌']].copy()
-                    growth_ranking['月销量增长率'] = growth_ranking['月销量增长率'] * 100
-                    growth_ranking = growth_ranking.sort_values('月销量增长率', ascending=False).head(20)
+                    # 准备数据
+                    rank_df = df.copy()
+                    rank_df['月销量增长率'] = rank_df['月销量增长率'] * 100
+                    rank_df = rank_df.sort_values('月销量增长率', ascending=False).head(20)
+
+                    # 选取展示列 (把图片列放到第一位)
+                    display_cols = ['Product_Img', 'ASIN', '月销量', '月销量增长率', '价格($)']
+                    # 确保列存在
+                    display_cols = [c for c in display_cols if c in rank_df.columns]
 
                     st.dataframe(
-                        growth_ranking,
+                        rank_df[display_cols],
                         hide_index=True,
                         column_config={
+                            "Product_Img": st.column_config.ImageColumn(
+                                "产品主图",
+                                help="点击查看大图",
+                                width="small"  # 设置图片大小
+                            ),
                             "ASIN": st.column_config.TextColumn("ASIN", width="small"),
-                            "月销量": st.column_config.ProgressColumn("月销量", format="%d", min_value=0,
-                                                                      max_value=int(df['月销量'].max())),
-                            "月销量增长率": st.column_config.NumberColumn("增长率 (%)", format="%.1f%%"),
-                            "价格($)": st.column_config.NumberColumn("价格", format="$%.2f")
+                            "月销量": st.column_config.ProgressColumn(
+                                "月销量",
+                                format="%d",
+                                min_value=0,
+                                max_value=int(df['月销量'].max())
+                            ),
+                            "月销量增长率": st.column_config.NumberColumn(
+                                "增长率",
+                                format="%.1f%%"
+                            ),
+                            "价格($)": st.column_config.NumberColumn(
+                                "价格",
+                                format="$%.2f"
+                            )
                         },
-                        height=500
+                        height=600  # 稍微调高一点，展示图片需要空间
                     )
 
             st.divider()
@@ -671,6 +782,58 @@ def main():
                 - **新品机会**: 过去3个月上架的新品占据了 **{new_product_rate:.1f}%** 的市场份额。
                 - **分析建议**: 结合上方的"属性分析"与"增长率矩阵"，优先开发高增长低竞争的细分属性。
                 """)
+                # ==========================================
+                # 🤖 AI 智能分析模块 (调用独立文件)
+                # ==========================================
+                st.markdown("---")
+                st.subheader("🤖 AI 深度选品顾问")
+                st.caption("基于当前清洗后的数据，调用大模型生成专业分析报告")
+
+                # 配置区域
+                with st.expander("⚙️ 配置 AI 模型 (DeepSeek / OpenAI / Kimi)", expanded=False):
+                    c_api1, c_api2, c_api3 = st.columns(3)
+                    user_api_key = c_api1.text_input("API Key", type="password", help="输入你的 API Key")
+                    user_base_url = c_api2.text_input("Base URL", value="https://api.deepseek.com",
+                                                      help="OpenAI 填 https://api.openai.com/v1")
+                    user_model = c_api3.text_input("Model Name", value="deepseek-chat",
+                                                   help="例如 gpt-4o, deepseek-chat")
+
+                # 触发按钮
+                if st.button("✨ 生成 AI 深度报告", type="primary"):
+                    if not user_api_key:
+                        st.warning("⚠️ 请先在上方配置 API Key")
+                    else:
+                        # 创建一个空容器用于流式输出
+                        report_box = st.empty()
+                        full_text = ""
+
+                        with st.spinner("🤖 AI 正在分析数据并撰写报告..."):
+                            # --- 调用独立模块 ---
+                            stream_response = ai_analysis.get_market_analysis_stream(
+                                df=df,
+                                api_key=user_api_key,
+                                base_url=user_base_url,
+                                model_name=user_model,
+                                target_attr=target_attr
+                            )
+
+                            # 处理返回结果
+                            if isinstance(stream_response, str) and stream_response.startswith("Error"):
+                                st.error(f"调用失败: {stream_response}")
+                            else:
+                                # 流式渲染
+                                for chunk in stream_response:
+                                    if chunk.choices[0].delta.content is not None:
+                                        full_text += chunk.choices[0].delta.content
+                                        # 实时更新 UI，加上光标效果
+                                        report_box.markdown(full_text + "▌")
+
+                                # 渲染完成，移除光标
+                                report_box.markdown(full_text)
+                                st.success("✅ 分析完成")
+
+                                # (可选) 如果你想把 AI 结论也放入导出图表字典中，可以在这里操作
+                                # export_charts["AI_Report"] = full_text
 
             # --- 导出逻辑 (V9.0: 原版 HTML 结构 + JSON图表注入) ---
             if st.sidebar.button("🔄 生成交互式HTML报告"):
